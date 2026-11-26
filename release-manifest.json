@@ -1,0 +1,20 @@
+{
+  "schema": "boss-auto-reply-release/v1",
+  "name": "boss-auto-reply",
+  "version": "0.0.2-beta",
+  "channel": "beta",
+  "released_at": "2026-11-26",
+  "mcp": {
+    "command": "runtime/env/Scripts/python.exe",
+    "args": [
+      "scripts/reply_mcp.py"
+    ]
+  },
+  "entrypoints": {
+    "listener": "scripts/reply.py",
+    "native_bridge": "scripts/native_uia.py",
+    "overlay": "scripts/reply_overlay.py"
+  },
+  "package": "dist/boss-auto-reply-0.0.2-beta.zip",
+  "checksum": "dist/boss-auto-reply-0.0.2-beta.zip.sha256"
+}
