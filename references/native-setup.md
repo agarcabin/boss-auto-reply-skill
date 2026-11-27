@@ -7,7 +7,7 @@
 3. `layout_mode=text_sequence` 时，profile 的 list_class/item_class 定位会话列表与条目；条目正文按顶层 Text 控件的顺序解析，未读数字是可缺省的第一项，日期之后依次为姓名、岗位、预览。选中项用会话头 name_class/job_class 与条目姓名/岗位反查，不依赖页面未暴露的 `selected` 类。旧布局可显式设置 `layout_mode=classic` 再提供 unread_class/selected_class/contact_name_class。
 4. message_root_class/message_class/message_text_class 分别定位聊天区、消息条目和正文。消息方向只看 message-item 的直接子控件：`figure` 或 `item-friend` 为候选人，仅 `text` 为招聘方，`message-card-wrap` 为系统卡片。正文必须位于唯一的 `text` 容器内，状态词“已读/送达”不进入对话。editor_class 是消息编辑器，send_class 是唯一原生发送按钮。
 5. 会话身份使用宿主绑定、候选人姓名和岗位组成的逻辑键；同一列表出现重名同岗位时停止，不能猜选。消息身份在当前原生文档内使用 runtime ID、姓名与正文；列表重排不能复用消息回执。核对后才设置 verified 和 stable_ids_verified。
-6. 监听只验证当前可见的会话区，不滚动到底。只处理带未读数字且岗位已映射的会话；每轮最多处理一个，发送后点击顶部“全部”取消选中，使下一条新消息重新形成红点。
+6. 监听只验证当前可见的会话区，不滚动到底。每轮先读取当前已打开会话；有新的候选人消息就先回复当前对话，没有新消息时才处理带未读数字且岗位已映射的左侧会话。每轮最多处理一个，发送后保持当前会话选中，不再点击顶部“全部”；下一轮继续优先检查当前窗口。
 7. 编辑器不暴露 ValuePattern 时，先确认 BOSS 顶层窗口已经是前台，再定位承载 BOSS URL 的唯一 `Chrome_RenderWidgetHost*` 子窗口，把原生焦点交给它并调用编辑器的 UIA `SetFocus`。只有 UIA 焦点确实落在 editor_class 后才用 `SendInput` 的 `KEYEVENTF_UNICODE` 分段输入；每四个字符及标点后通过 TextPattern 核对。不得使用坐标点击、回车发送或从后台抢焦点。
 8. “开始挂机”本身是用户对自动回复的明确授权。控制器在映射保存后自动核对一次 `draft_test` 写入和清空，设置 draft_verified；首次真实回复仍必须取得新增我方消息的平台回执，成功后设置 send_verified。平台结果不确定时记录 unknown、暂停，不自动重试，也不把未确认结果当成成功。
 

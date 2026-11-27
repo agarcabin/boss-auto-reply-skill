@@ -21,6 +21,7 @@ TEAL = '#0b7f8f'
 BORDER = '#d8e2e8'
 HEADER_BG = '#eaf1f5'
 MAX_VISIBLE_ROWS = 5.5
+AUTO_START_SECONDS = 300
 TABLE_COLUMNS = (
     ('开启', 0, 72),
     ('BOSS 岗位名称 / 状态', 3, 300),
@@ -34,12 +35,13 @@ def visible_row_count(job_count):
 
 
 class MappingWindow:
-    def __init__(self, root, inventory_path, state=None):
+    def __init__(self, root, inventory_path, state=None, settings=False):
         self.root = root
         self.state = Path(state or reply.STATE)
         self.inventory = reply.load(inventory_path)
         if not self.inventory.get('inventory_hash'):
             self.inventory = normalize_inventory(self.inventory)
+        self.settings_mode = settings
         self.cfg = reply.config()
         self.config_root = Path(self.cfg.get('job_config_root') or DEFAULT_ROOT).expanduser()
         self.preferences = Preferences(self.config_root)
@@ -48,7 +50,7 @@ class MappingWindow:
         self.rows = []
         self.cloud_ready = False
         self.auto_started = False
-        self.auto_start_deadline = time.monotonic() + 60
+        self.auto_start_deadline = None if settings else time.monotonic() + AUTO_START_SECONDS
         self._configure_window()
         self._build()
         self.root.after_idle(self._fit_window_height)
@@ -57,7 +59,8 @@ class MappingWindow:
         self.root.after(500, self.poll_auto_start)
 
     def _configure_window(self):
-        self.root.title('Boss 回复自动化 · 今日岗位对应')
+        self.root.title('Boss 回复自动化 · 挂机设置' if self.settings_mode
+                        else 'Boss 回复自动化 · 今日岗位对应')
         self.root.configure(bg=BG)
         self.root.geometry('1120x1')
         self.root.minsize(940, 1)
@@ -75,7 +78,9 @@ class MappingWindow:
         tk.Label(header, text='Boss 回复自动化', bg=NAVY, fg='white',
                  font=('Microsoft YaHei UI', 20, 'bold')).grid(
                      row=0, column=0, sticky='w', padx=28, pady=(18, 3))
-        tk.Label(header, text='确认今日 BOSS 岗位对应的云端企业及岗位',
+        tk.Label(header, text=('实时调整挂机的 BOSS 岗位与云端对应，保存后立即生效'
+                               if self.settings_mode
+                               else '确认今日 BOSS 岗位对应的云端企业及岗位'),
                  bg=NAVY, fg='#c9dbe7', font=('Microsoft YaHei UI', 10)).grid(
                      row=1, column=0, sticky='w', padx=28, pady=(0, 14))
 
@@ -91,7 +96,7 @@ class MappingWindow:
 
         path_card = tk.Frame(content, bg='#eaf2f6')
         path_card.pack(fill='x', pady=(10, 0))
-        tk.Label(path_card, text='岗位配置目录', bg='#eaf2f6', fg=MUTED,
+        tk.Label(path_card, text='回复配置目录', bg='#eaf2f6', fg=MUTED,
                  font=('Microsoft YaHei UI', 9, 'bold')).pack(side='left', padx=(14, 8), pady=9)
         tk.Label(path_card, text=str(self.config_root), bg='#eaf2f6', fg=INK,
                  font=('Consolas', 9)).pack(side='left', pady=9)
@@ -135,9 +140,11 @@ class MappingWindow:
         footer.pack(side='bottom', fill='x', pady=(12, 0))
         tk.Label(footer, text='未开启的岗位不会自动回复。保存后仍需通过原生页面就绪检查。',
                  bg=BG, fg=MUTED, font=('Microsoft YaHei UI', 9)).pack(side='left')
-        tk.Button(footer, text='取消', command=self.root.destroy, bg='#ffffff', fg=INK,
-                  activebackground='#edf2f5', relief='solid', bd=1, padx=18, pady=7).pack(side='right')
-        self.save_button = tk.Button(footer, text='开始挂机', command=self.save,
+        tk.Button(footer, text='关闭' if self.settings_mode else '取消', command=self.root.destroy,
+                  bg='#ffffff', fg=INK, activebackground='#edf2f5', relief='solid',
+                  bd=1, padx=18, pady=7).pack(side='right')
+        self.save_button = tk.Button(footer, text='保存设置' if self.settings_mode else '开始挂机',
+                                     command=self.save,
                                      bg=TEAL, fg='white', activebackground='#086c79',
                                      activeforeground='white', disabledforeground='#d9f0f3',
                                      relief='flat', padx=20, pady=8,
@@ -281,6 +288,17 @@ class MappingWindow:
                 'cloud_position': row['position'].get(),
             } for row in self.rows]
             mapping = validate_mapping(self.inventory, self.cloud_catalog, choices, self.config_root)
+            mapping['config_root'] = str(self.config_root)
+            mapping['job_enabled'] = {
+                row['title']: bool(row.get('enabled'))
+                for row in mapping['mappings']
+            }
+            mapping['enabled_jobs'] = [
+                row['title'] for row in mapping['mappings'] if row.get('enabled')
+            ]
+            mapping['disabled_jobs'] = [
+                row['title'] for row in mapping['mappings'] if not row.get('enabled')
+            ]
             path = self.state / 'daily' / (today() + '-' + fingerprint(mapping['account'])[:12] + '.json')
             reply.save(path, mapping)
             reply.save(self.state / 'last-mapping.json', mapping)
@@ -295,23 +313,35 @@ class MappingWindow:
             cfg['daily_mapping_file'] = str(path)
             cfg['allowed_jobs'] = sorted({row['cloud_project'] for row in mapping['mappings'] if row.get('enabled')})
             cfg['job_aliases'] = {row['title']: row['cloud_project'] for row in mapping['mappings'] if row.get('enabled')}
+            cfg['job_enabled'] = mapping['job_enabled']
+            cfg['enabled_jobs'] = mapping['enabled_jobs']
+            cfg['disabled_jobs'] = mapping['disabled_jobs']
             cfg['mode'] = 'cloud'
             cfg['max_rounds'] = 0
             cfg['account'] = mapping['account']
             cfg['state_dir'] = str(self.state)
+            cfg['automation_revision'] = str(time.time_ns())
             reply.save(self.state / 'config.json', cfg)
-            reply.save(self.state / 'start-request.json', {
-                'date': today(), 'account': mapping['account'], 'mapping_file': str(path),
-                'inventory_hash': mapping['inventory_hash'], 'send_authorized': True, 'state': 'requested'})
-            self.message.set(('超过 1 分钟未操作，已按当前岗位对应自动开始。'
-                              if automatic else '已保存。正在检查原生页面，就绪后开始回复自动化。'))
+            if self.settings_mode:
+                self.message.set('设置已保存，运行中的挂机已实时应用。')
+            else:
+                reply.save(self.state / 'start-request.json', {
+                    'date': today(), 'account': mapping['account'], 'mapping_file': str(path),
+                    'inventory_hash': mapping['inventory_hash'], 'send_authorized': True,
+                    'state': 'requested'})
+                self.message.set(('超过 5 分钟未操作，已按当前岗位对应自动开始。'
+                                  if automatic else '已保存。正在检查原生页面，就绪后开始回复自动化。'))
             self.message_label.configure(fg='#146b5b')
             self.save_button.configure(state='disabled')
+            if self.settings_mode:
+                self.root.after(1200, self.root.destroy)
         except (OSError, ValueError, KeyError) as exc:
             self.auto_started = False
             messagebox.showerror('尚不能开始', str(exc), parent=self.root)
 
     def poll_startup(self):
+        if self.settings_mode:
+            return
         status = self.state / 'startup-status.json'
         try:
             if status.exists():
@@ -329,7 +359,7 @@ class MappingWindow:
         self.root.after(1000, self.poll_startup)
 
     def poll_auto_start(self):
-        if self.auto_started:
+        if self.settings_mode or self.auto_started or self.auto_start_deadline is None:
             return
         remaining = max(0, int(self.auto_start_deadline - time.monotonic() + .999))
         valid = self.cloud_ready and any(
@@ -340,7 +370,7 @@ class MappingWindow:
             if remaining:
                 self.message.set(f'已恢复上次选择；{remaining} 秒内可手动调整，超时后自动开始。')
             elif not self.auto_started:
-                self.message.set('超过 1 分钟未操作，正在按当前岗位对应自动开始。')
+                self.message.set('超过 5 分钟未操作，正在按当前岗位对应自动开始。')
                 self.message_label.configure(fg='#146b5b')
                 self.root.after(300, lambda: self.save(automatic=True))
         elif remaining:
@@ -351,6 +381,8 @@ class MappingWindow:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--inventory', required=True)
+    parser.add_argument('--state-dir', type=Path, default=reply.STATE)
+    parser.add_argument('--settings', action='store_true')
     args = parser.parse_args()
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -358,7 +390,7 @@ def main():
         pass
     root = tk.Tk()
     try:
-        MappingWindow(root, args.inventory)
+        MappingWindow(root, args.inventory, state=args.state_dir, settings=args.settings)
     except Exception as exc:
         root.withdraw()
         messagebox.showerror('Boss 回复自动化', f'岗位对应窗口无法启动：{exc}')

@@ -43,6 +43,10 @@ SPECS = [
         'send': {'type': 'boolean'}}, []),
     spec('boss_reply_screen', 'Read or toggle the bound Codex/BOSS window between primary and secondary displays.', {
         'action': {'type': 'string', 'enum': ['status', 'toggle']}}, []),
+    spec('boss_reply_history', 'Read locally saved chat history and exchanged contacts; no BOSS page access and no model call.', {
+        'candidate': {'type': 'string'}, 'job': {'type': 'string'},
+        'conversation_id': {'type': 'string'}, 'limit': {'type': 'number'}}, []),
+    spec('boss_reply_report', 'Open the local read-only HTML communication report.', {}, []),
 ]
 
 
@@ -65,6 +69,9 @@ def call(name, arguments):
         'boss_reply_resolve': store.resolve,
         'boss_reply_start': lambda send=True: start(store, send),
         'boss_reply_screen': lambda action='status': screen(store, action),
+        'boss_reply_history': lambda candidate='', job='', conversation_id='', limit=20: reply.records_history(
+            candidate, job, conversation_id, limit),
+        'boss_reply_report': lambda: reply.open_report(),
     }
     known = next((s for s in SPECS if s['name'] == name), None)
     if not known or not isinstance(arguments, dict):
@@ -154,6 +161,7 @@ def start(store, send=True):
             store.control('resume')
             return {'state': 'resumed', **status(store)}
     opened = open_boss()
+    reply.Native(reply.config()).call('prepare_messages')
     command = [sys.executable, str(reply.ROOT / 'scripts/reply.py'), 'start']
     if send:
         command.append('--send')
@@ -166,9 +174,11 @@ def start(store, send=True):
     except ValueError:
         raise ValueError('listener_start_failed: ' +
                          (completed.stderr or completed.stdout or '')[-800:])
-    if completed.returncode or value.get('error'):
+    if completed.returncode or value.get('error') or value.get('ready_to_listen') is False:
         raise ValueError('listener_start_failed: ' +
-                         (value.get('error') or completed.stderr or '')[-800:])
+                         (value.get('error') or
+                          ('; '.join(value.get('problems') or []) if value.get('problems') else '') or
+                          completed.stderr or '' or '岗位勾选或监听配置未就绪')[-800:])
     return {'state': 'started', 'open': opened, **value}
 
 
@@ -225,7 +235,7 @@ def serve():
         params = message.get('params') or {}
         if method == 'initialize':
             result = {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}},
-                      'serverInfo': {'name': 'boss-auto-reply', 'version': '0.0.2-beta'}}
+                      'serverInfo': {'name': 'boss-auto-reply', 'version': '0.0.3'}}
         elif method == 'ping':
             result = {}
         elif method == 'tools/list':

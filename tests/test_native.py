@@ -92,11 +92,42 @@ class NativeParserTests(unittest.TestCase):
         bridge.editor_text = lambda editor: '第一句结束。'
         bridge.wait_editor_text('editor', '第一句结束。 ')
 
-    def test_overlay_has_three_action_buttons(self):
+    def test_overlay_has_five_action_buttons_in_requested_order(self):
         geometry = button_geometry()
-        self.assertEqual(len(geometry['widths']), 3)
-        self.assertGreaterEqual(sum(geometry['widths']) + geometry['gap'] * 2,
+        self.assertEqual(len(geometry['widths']), 5)
+        self.assertGreaterEqual(sum(geometry['widths']) + geometry['gap'] * 4,
                                 280)
+
+    def test_boss_login_notice_is_confirmed_via_native_button(self):
+        class Node:
+            def __init__(self, name='', control_type=0, class_name='', offscreen=False):
+                self.CurrentName = name
+                self.CurrentControlType = control_type
+                self.CurrentClassName = class_name
+                self.CurrentIsOffscreen = offscreen
+
+        notice = Node('您的账号已经登录过了，请勿重复登录。', 50020)
+        confirm = Node('确定', 50000, 'MdTextButton')
+        dialog = Node('www.zhipin.com 显示', 50032, 'RootView')
+
+        class FakeUia:
+            def __init__(self):
+                self.calls = 0
+
+            def ElementFromHandle(self, hwnd):
+                self.calls += 1
+                return 'window-before' if self.calls == 1 else 'window-after'
+
+        bridge = Bridge.__new__(Bridge)
+        bridge.uia = FakeUia()
+        bridge.all = lambda root: (
+            [dialog] if root == 'window-before'
+            else [notice, confirm] if root is dialog else [])
+        invoked = []
+        bridge.invoke = lambda node: invoked.append(node) or 'msaa_default_action'
+
+        self.assertEqual(bridge.dismiss_boss_login_notice(1), 'dismissed')
+        self.assertEqual(invoked, [confirm])
 
 
 if __name__ == '__main__':

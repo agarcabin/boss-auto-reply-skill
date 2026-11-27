@@ -19,7 +19,7 @@ import screen_switch
 
 
 PANEL_WIDTH = 760
-BUTTON_WIDTH = 340
+BUTTON_WIDTH = 520
 PANEL_HEIGHT = 80
 PANEL_TOP = 6
 PANEL_ALPHA = 0.84
@@ -98,7 +98,7 @@ def _save(path, value):
     os.replace(temporary, path)
 
 
-def overlay_windows():
+def titled_windows(expected_title):
     user = ctypes.WinDLL('user32', use_last_error=True)
     user.IsWindowVisible.argtypes = [wintypes.HWND]
     user.GetWindowTextLengthW.argtypes = [wintypes.HWND]
@@ -115,7 +115,7 @@ def overlay_windows():
             return True
         title = ctypes.create_unicode_buffer(length + 1)
         user.GetWindowTextW(hwnd, title, len(title))
-        if title.value == 'BOSS 回复自动化 · 悬浮窗':
+        if title.value == expected_title:
             pid = wintypes.DWORD()
             user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             found.append({'hwnd': int(hwnd), 'pid': pid.value})
@@ -125,6 +125,14 @@ def overlay_windows():
     user.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
     user.EnumWindows(callback, 0)
     return found
+
+
+def overlay_windows():
+    return titled_windows('BOSS 回复自动化 · 悬浮窗')
+
+
+def settings_windows():
+    return titled_windows('Boss 回复自动化 · 挂机设置')
 
 
 def launch(state_dir=None):
@@ -163,7 +171,7 @@ def launch(state_dir=None):
 
 def button_geometry():
     height = 64
-    widths = [100, 104, 88]
+    widths = [118, 84, 84, 96, 84]
     return {'y': 8, 'height': height, 'gap': 8, 'x': 8, 'widths': widths}
 
 
@@ -202,12 +210,14 @@ class ReplyOverlay:
         geometry = button_geometry()
         self.rects = []
         self.texts = []
-        self.enabled = [False, True, False]
+        self.enabled = [False, False, False, True, False]
         self.display_button = {'label': '副屏', 'color': 'yellow'}
         self.display_notice = ''
         self.display_notice_until = 0
         x = PANEL_WIDTH + geometry['x']
-        for index, (label, width) in enumerate(zip(('暂停', '停止', '副屏'), geometry['widths'])):
+        for index, (label, width) in enumerate(
+                zip(('回复当前窗口', '暂停', '终止', '查看报告', '副屏'),
+                    geometry['widths'])):
             x1 = x + sum(geometry['widths'][:index]) + geometry['gap'] * index
             x2 = x1 + width
             self.rects.append(_rounded_rectangle(
@@ -221,15 +231,20 @@ class ReplyOverlay:
                                  lambda _event, i=index: self.hover(i, True))
             self.canvas.tag_bind(f'button-{index}', '<Leave>',
                                  lambda _event, i=index: self.hover(i, False))
-        self.canvas.tag_bind('button-0', '<Button-1>', lambda _event: self.toggle_pause())
-        self.canvas.tag_bind('button-1', '<Button-1>', lambda _event: self.stop())
-        self.canvas.tag_bind('button-2', '<Button-1>', lambda _event: self.toggle_display())
+        self.canvas.tag_bind('button-0', '<Button-1>', lambda _event: self.reply_current())
+        self.canvas.tag_bind('button-1', '<Button-1>', lambda _event: self.toggle_pause())
+        self.canvas.tag_bind('button-2', '<Button-1>', lambda _event: self.stop())
+        self.canvas.tag_bind('button-3', '<Button-1>', lambda _event: self.open_report())
+        self.canvas.tag_bind('button-4', '<Button-1>', lambda _event: self.toggle_display())
         self.last_data = {}
         self.stopped_since = None
+        self.requested_stop = False
         self.root.deiconify()
         self.keep_topmost()
         self.refresh()
         self.root.mainloop()
+        if self.requested_stop:
+            self.wait_listener_and_confirm()
 
     def keep_topmost(self):
         self.root.api.user.SetWindowPos(
@@ -255,6 +270,8 @@ class ReplyOverlay:
                 data['last_error'] = settings.get('last_error', '')
                 data['pid'] = settings.get('pid', '')
                 data['stage'] = settings.get('overlay_stage', '正在检查当前可见会话')
+                data['current'] = settings.get('overlay_current', '')
+                data['queue_next'] = settings.get('overlay_queue_next', '')
                 data['notice'] = settings.get('overlay_notice', '')
                 data['notice_until'] = settings.get('overlay_notice_until', '0')
                 data['visible'] = settings.get('overlay_visible_count', '0')
@@ -272,13 +289,13 @@ class ReplyOverlay:
     def hover(self, index, hover):
         enabled = self.enabled[index]
         fill = BUTTON_ACTIVE_BG if enabled and hover else (BUTTON_BG if enabled else BUTTON_DISABLED_BG)
-        if index == 2 and enabled:
+        if index == 4 and enabled:
             fill = DISPLAY_BUTTON_COLORS[self.display_button['color']][bool(hover)]
         self.canvas.itemconfigure(self.rects[index], fill=fill)
 
     def toggle_pause(self):
         self.log_event('pause_button')
-        if not self.enabled[0]:
+        if not self.enabled[1]:
             self.log_event('pause_button_disabled')
             return
         try:
@@ -293,8 +310,34 @@ class ReplyOverlay:
                 pass
         self.refresh()
 
+    def reply_current(self):
+        self.log_event('reply_current_button')
+        if not self.enabled[0]:
+            self.log_event('reply_current_button_disabled')
+            return
+        try:
+            Store(self.db_path).setting('overlay_reply_current', str(time.time()))
+            self.display_notice = '已请求立即检查并回复当前窗口'
+        except Exception as exc:
+            self.display_notice = '回复当前窗口失败：' + str(exc)
+        self.display_notice_until = time.time() + 10
+        self.refresh()
+
+    def open_report(self):
+        self.log_event('report_button')
+        try:
+            import reply_report
+            result = reply_report.open_report(
+                self.state, reply.config().get('reply_records_root'))
+            self.display_notice = '报告已打开：' + result.get('url', '')
+        except Exception as exc:
+            self.display_notice = '报告打开失败：' + str(exc)
+        self.display_notice_until = time.time() + 10
+        self.refresh()
+
     def stop(self):
         self.log_event('stop_button')
+        self.requested_stop = True
         try:
             Store(self.db_path).control('stop')
             request = self.state / 'start-request.json'
@@ -309,9 +352,87 @@ class ReplyOverlay:
                 pass
         self.refresh()
 
+    def wait_listener_and_confirm(self):
+        """Wait until the listener process really exits, then offer the report."""
+        pid = ''
+        try:
+            pid = Store(self.db_path).setting('pid') or ''
+        except Exception:
+            pass
+        deadline = time.monotonic() + 90
+        if pid:
+            while time.monotonic() < deadline:
+                try:
+                    alive = bool(screen_switch.process_birth(pid))
+                except Exception:
+                    alive = False
+                if not alive:
+                    break
+                time.sleep(.4)
+        self.confirm_report_after_stop()
+
+    def confirm_report_after_stop(self):
+        """After a normal stop, offer today's offline report."""
+        try:
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            user32.MessageBoxW.argtypes = [
+                wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+            user32.MessageBoxW.restype = ctypes.c_int
+            choice = user32.MessageBoxW(
+                0, '程序已正常关闭，是否打开本日报告？', 'BOSS 自动回复',
+                0x00000004 | 0x00000020 | 0x00040000)
+            if choice != 6:
+                return
+            import reply_report
+            cfg = reply.config()
+            root = Path(cfg.get('reply_records_root') or reply.REPLY_RECORDS_ROOT)
+            day = time.strftime('%Y-%m-%d')
+            target = root / f'{day}.html'
+            if not target.exists():
+                reply_report.export_daily_snapshot(root, day)
+            os.startfile(str(target))
+        except Exception as exc:
+            try:
+                Store(self.db_path).setting(
+                    'last_error', 'report_after_stop_failed:' + str(exc))
+            except Exception:
+                pass
+
+    def open_settings(self):
+        self.log_event('settings_button')
+        inventory = _load(self.state / 'daily-inventory.json')
+        if not inventory.get('jobs') or inventory.get('date') != time.strftime('%Y-%m-%d'):
+            self.log_event('settings_button_disabled')
+            self.display_notice = '请先完成今日岗位盘点'
+            self.display_notice_until = time.time() + 10
+            self.refresh()
+            return
+        try:
+            existing = settings_windows()
+            if existing:
+                user = ctypes.windll.user32
+                user.ShowWindow(existing[0]['hwnd'], 9)
+                user.SetForegroundWindow(existing[0]['hwnd'])
+                self.display_notice = '设置窗口已打开'
+            else:
+                pythonw = Path(sys.executable).with_name('pythonw.exe')
+                command = [
+                    str(pythonw if pythonw.is_file() else sys.executable),
+                    '-X', 'utf8', str(Path(__file__).with_name('mapping_window.py')),
+                    '--inventory', str(self.state / 'daily-inventory.json'),
+                    '--settings', '--state-dir', str(self.state)]
+                with (self.state / 'mapping-ui.log').open('a', encoding='utf-8') as log:
+                    subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                     creationflags=subprocess.CREATE_NO_WINDOW)
+                self.display_notice = '已打开挂机设置窗口'
+        except Exception as exc:
+            self.display_notice = '设置窗口打开失败：' + str(exc)
+        self.display_notice_until = time.time() + 10
+        self.refresh()
+
     def toggle_display(self):
         self.log_event('screen_button')
-        if not self.enabled[2]:
+        if not self.enabled[4]:
             self.log_event('screen_button_disabled')
             return
         try:
@@ -357,12 +478,21 @@ class ReplyOverlay:
             notice_active = False
         stage = ((data.get('notice') or data.get('stage')) if notice_active
                  else data.get('stage') or data.get('startup_message') or '正在检查当前可见会话')
+        current = (data.get('current') or '').strip()
+        if current:
+            stage = f'{current}：{stage}'
+        next_name = (data.get('queue_next') or '').strip()
+        if current and next_name:
+            short_current = current.split('（', 1)[0]
+            stage = f'{stage}（目前：{short_current}，下一个：{next_name}）'
         heartbeat = ''
         try:
             age = max(0, int(time.time() - float(data['heartbeat'])))
             heartbeat = f' · 心跳 {age} 秒前'
         except (TypeError, ValueError):
             pass
+        if next_name:
+            heartbeat = ''
         self.canvas.itemconfigure(self.state_text, text=f'{label} · {stage}{heartbeat}')
         detail = (f"可见 {data.get('visible', '0')} · 未读 {data.get('unread', '0')} · "
                   f"待回复 {pending} · 已发送 {data.get('sent', 0)}")
@@ -378,23 +508,32 @@ class ReplyOverlay:
             display_ok = True
         except Exception:
             self.display_button = {'label': '切屏', 'color': 'gray'}
-        self.enabled = [control in ('running', 'paused'), control != 'stopped', display_ok]
+        self.enabled = [control == 'running', control in ('running', 'paused'),
+                        control != 'stopped', True, display_ok]
         self.canvas.itemconfigure(self.texts[0],
-                                  text=('继续' if control == 'paused' else '暂停'),
                                   fill='#F4F7FA' if self.enabled[0] else '#7C8A97')
         self.canvas.itemconfigure(self.rects[0],
                                   fill=BUTTON_BG if self.enabled[0] else BUTTON_DISABLED_BG)
         self.canvas.itemconfigure(self.texts[1],
+                                  text=('继续' if control == 'paused' else '暂停'),
                                   fill='#F4F7FA' if self.enabled[1] else '#7C8A97')
         self.canvas.itemconfigure(self.rects[1],
                                   fill=BUTTON_BG if self.enabled[1] else BUTTON_DISABLED_BG)
         self.canvas.itemconfigure(self.texts[2],
-                                  text=self.display_button['label'],
                                   fill='#F4F7FA' if self.enabled[2] else '#7C8A97')
+        self.canvas.itemconfigure(self.rects[2],
+                                  fill=BUTTON_BG if self.enabled[2] else BUTTON_DISABLED_BG)
+        self.canvas.itemconfigure(self.texts[3],
+                                  fill='#F4F7FA' if self.enabled[3] else '#7C8A97')
+        self.canvas.itemconfigure(self.rects[3],
+                                  fill=BUTTON_BG if self.enabled[3] else BUTTON_DISABLED_BG)
+        self.canvas.itemconfigure(self.texts[4],
+                                  text=self.display_button['label'],
+                                  fill='#F4F7FA' if self.enabled[4] else '#7C8A97')
         self.canvas.itemconfigure(
-            self.rects[2],
+            self.rects[4],
             fill=(DISPLAY_BUTTON_COLORS[self.display_button['color']][0]
-                  if self.enabled[2] else BUTTON_DISABLED_BG))
+                  if self.enabled[4] else BUTTON_DISABLED_BG))
         if control == 'stopped':
             if self.stopped_since is None:
                 self.stopped_since = time.monotonic()

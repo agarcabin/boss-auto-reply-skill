@@ -30,6 +30,8 @@ _PLATFORM_NOTICE_MARKERS = (
     '该职位是集招职位', '该职位为集招职位',
     '回复需消耗沟通权益', '本条消息不消耗权益',
     '使用企业VIP回复',
+    '请求交换微信', '请求交换电话', '请求交换简历',
+    '交换微信已发送', '交换电话已发送',
 )
 
 
@@ -151,6 +153,57 @@ def _send_keyboard_records(records):
     array = (_INPUT * len(records))(*records)
     if user.SendInput(len(records), array, ctypes.sizeof(_INPUT)) != len(records):
         raise ValueError('native_keyboard_input_rejected')
+
+
+def click_screen_point(x, y):
+    """Click a verified UIA node center. Used only for native toolbar actions."""
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    user.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user.SetCursorPos.restype = wintypes.BOOL
+    if not user.SetCursorPos(int(x), int(y)):
+        raise ValueError('native_mouse_position_rejected')
+    down = _INPUT(type=0)
+    down.mi = _MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=0x0002,
+                          time=0, dwExtraInfo=0)
+    up = _INPUT(type=0)
+    up.mi = _MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=0x0004,
+                        time=0, dwExtraInfo=0)
+    array = (_INPUT * 2)(down, up)
+    user.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    user.SendInput.restype = wintypes.UINT
+    if user.SendInput(2, array, ctypes.sizeof(_INPUT)) != 2:
+        raise ValueError('native_mouse_input_rejected')
+
+
+def scroll_screen_wheel(x, y, clicks):
+    """Scroll a verified area with the mouse wheel (negative = down)."""
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    user.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user.SetCursorPos.restype = wintypes.BOOL
+    if not user.SetCursorPos(int(x), int(y)):
+        raise ValueError('native_mouse_position_rejected')
+    record = _INPUT(type=0)
+    record.mi = _MOUSEINPUT(
+        dx=0, dy=0,
+        mouseData=ctypes.c_uint32(int(clicks) * 120).value,
+        dwFlags=0x0800, time=0, dwExtraInfo=0)
+    array = (_INPUT * 1)(record)
+    user.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    user.SendInput.restype = wintypes.UINT
+    if user.SendInput(1, array, ctypes.sizeof(_INPUT)) != 1:
+        raise ValueError('native_mouse_input_rejected')
+
+
+def is_exchange_request_text(text):
+    text = text or ''
+    if '交换' not in text:
+        return False
+    if not any(kind in text for kind in ('微信', '电话', '手机', '简历')):
+        return False
+    if '已发送' in text or '已通过' in text:
+        return False
+    return any(marker in text for marker in (
+        '请求', '是否同意', '想和您交换', '我想要和您交换', '希望和您交换'))
 
 
 def _send_unicode_text(value):
@@ -294,6 +347,15 @@ class Bridge:
             return pointer.QueryInterface(interface) if pointer else None
         except Exception:
             return None
+
+    def find_all_named(self, root, name):
+        """Fast UIA name lookup; avoids walking the whole BOSS tree."""
+        try:
+            condition = self.uia.CreatePropertyCondition(30005, name)
+            found = root.FindAll(4, condition)
+            return [found.GetElement(i) for i in range(found.Length)]
+        except Exception:
+            return []
 
     def text(self, node):
         p = self.pattern(node, 10002, U.IUIAutomationValuePattern)
@@ -481,6 +543,7 @@ class Bridge:
         w = self.uia.ElementFromHandle(int(b['hwnd']))
         if w.CurrentProcessId != b['pid']:
             raise ValueError('bound_window_changed')
+        self.dismiss_boss_login_notice(int(b['hwnd']))
         docs = self.window_docs(b['hwnd'])
         chats = [d for d in docs if d.CurrentName == b['chat_title'] and self.url(d).startswith('app://')]
         bosses = [d for d in docs if not d.CurrentIsOffscreen
@@ -493,6 +556,7 @@ class Bridge:
 
     def bind(self, hwnd, chat_title):
         w = self.uia.ElementFromHandle(int(hwnd))
+        self.dismiss_boss_login_notice(int(hwnd))
         docs = self.window_docs(hwnd)
         chats = [d for d in docs if d.CurrentName == chat_title and self.url(d).startswith('app://')]
         bosses = [d for d in docs if self.url(d).startswith('https://www.zhipin.com/web/chat/')]
@@ -650,6 +714,7 @@ class Bridge:
 
     def open_boss(self):
         hwnd, chat_title = self.host_window()
+        self.dismiss_boss_login_notice(int(hwnd))
         root = self.uia.ElementFromHandle(int(hwnd))
         sidebar = self.collapse_sidebar(root)
         bosses = self.visible_boss_docs(hwnd)
@@ -659,6 +724,7 @@ class Bridge:
             deadline = time.monotonic() + 12.0
             while time.monotonic() < deadline:
                 time.sleep(.25)
+                self.dismiss_boss_login_notice(int(hwnd))
                 bosses = self.visible_boss_docs(hwnd)
                 if len(bosses) == 1:
                     break
@@ -730,15 +796,7 @@ class Bridge:
             return 'uia_select'
         raise ValueError('native_action_pattern_unavailable')
 
-    def named_action(self, root, label):
-        found = [n for n in self.all(root) if n.CurrentName == label and not n.CurrentIsOffscreen]
-        if len(found) > 1:
-            links = [n for n in found if n.CurrentControlType == 50005]
-            if len(links) == 1:
-                found = links
-        if len(found) != 1:
-            raise ValueError('native_named_target_not_unique:' + label)
-        node = found[0]
+    def invoke_with_parents(self, node):
         for _ in range(6):
             if self.pattern(node, 10000, U.IUIAutomationInvokePattern):
                 return self.invoke(node)
@@ -747,6 +805,179 @@ class Bridge:
                 return self.invoke(node)
             node = self.walker.GetParentElement(node)
         raise ValueError('native_named_target_not_invokable')
+
+    def invoke_near(self, node, depth=2):
+        """Invoke the node or a close ancestor; never the whole document."""
+        for _ in range(depth + 1):
+            if self.pattern(node, 10000, U.IUIAutomationInvokePattern):
+                return self.invoke(node)
+            legacy = self.pattern(node, 10018, U.IUIAutomationLegacyIAccessiblePattern)
+            if legacy and legacy.CurrentDefaultAction:
+                return self.invoke(node)
+            try:
+                node = self.walker.GetParentElement(node)
+            except Exception:
+                break
+        return None
+
+    def click_node_center(self, node):
+        """Invoke a node, or click the verified center of its closest container."""
+        route = self.invoke_near(node, depth=1)
+        if route:
+            return route
+        target = node
+        try:
+            parent = self.walker.GetParentElement(node)
+            if parent is not None:
+                inner = node.CurrentBoundingRectangle
+                outer = parent.CurrentBoundingRectangle
+                if (outer.right > outer.left and outer.bottom > outer.top
+                        and outer.left <= inner.left and outer.top <= inner.top
+                        and outer.right >= inner.right and outer.bottom >= inner.bottom):
+                    target = parent
+        except Exception:
+            pass
+        rect = target.CurrentBoundingRectangle
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            raise ValueError('toolbar_target_not_clickable')
+        if foreground_hwnd() != int(self.cfg['binding']['hwnd']):
+            raise ValueError('native_click_requires_foreground')
+        click_screen_point((rect.left + rect.right) // 2,
+                           (rect.top + rect.bottom) // 2)
+        return 'screen_click'
+
+    def confirm_exchange_dialog(self, label):
+        """BOSS asks 确定与对方交换微信/电话吗？ before sending the request."""
+        texts = {
+            '换微信': '确定与对方交换微信吗？',
+            '换电话': '确定与对方交换电话吗？',
+            '求简历': '确定与对方交换简历吗？',
+        }
+        dialog_text = texts.get(label)
+        if not dialog_text:
+            return None
+        for _ in range(8):
+            time.sleep(.25)
+            try:
+                root = self.bound()
+            except Exception:
+                continue
+            dialog = [n for n in self.find_all_named(root, dialog_text)
+                      if not n.CurrentIsOffscreen]
+            if not dialog:
+                continue
+            rect = dialog[0].CurrentBoundingRectangle
+            center = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+            confirms = [n for n in self.find_all_named(root, '确定')
+                        if not n.CurrentIsOffscreen]
+            if confirms:
+                def distance(node):
+                    box = node.CurrentBoundingRectangle
+                    return (abs((box.left + box.right) / 2 - center[0])
+                            + abs((box.top + box.bottom) / 2 - center[1]))
+                confirms.sort(key=distance)
+                return self.click_node_center(confirms[0])
+            cancels = [n for n in self.find_all_named(root, '取消')
+                       if not n.CurrentIsOffscreen]
+            if cancels:
+                self.click_node_center(cancels[0])
+            raise ValueError('exchange_confirm_unavailable:' + label)
+        return None
+
+    def named_action(self, root, label):
+        found = [n for n in self.all(root) if n.CurrentName == label and not n.CurrentIsOffscreen]
+        if len(found) > 1:
+            preferred = [n for n in found
+                         if n.CurrentControlType in (50020, 50005)]
+            if preferred:
+                found = preferred
+        if len(found) > 1:
+            def area(node):
+                rect = node.CurrentBoundingRectangle
+                return max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+            found.sort(key=area)
+            if area(found[1]) > area(found[0]) * 1.2:
+                found = [found[0]]
+        if len(found) != 1:
+            raise ValueError('native_named_target_not_unique:' + label)
+        return self.invoke_with_parents(found[0])
+
+    def find_toolbar(self, label):
+        root = self.bound()
+        found = []
+        for node in self.all(root):
+            try:
+                if node.CurrentIsOffscreen:
+                    continue
+                name = (node.CurrentName or '').strip()
+                if name == label or (name.startswith(label)
+                                     and len(name) <= len(label) + 3):
+                    found.append(node)
+            except Exception:
+                continue
+        if len(found) > 1:
+            links = [n for n in found if n.CurrentControlType == 50005]
+            if len(links) == 1:
+                found = links
+        if len(found) != 1:
+            raise ValueError('toolbar_target_not_unique:' + label)
+        return found[0]
+
+    def click_toolbar(self, label):
+        """Click a BOSS conversation toolbar action by its visible label.
+
+        The WeChat/phone exchange spans can carry a remaining-count badge, so
+        the label may be followed by a short number.
+        """
+        node = self.find_toolbar(label)
+        if not node.CurrentIsEnabled:
+            raise ValueError('toolbar_target_disabled:' + label)
+        route = self.click_node_center(node)
+        confirmed_dialog = self.confirm_exchange_dialog(label)
+        return {'state': 'exchange_sent' if confirmed_dialog else 'exchange_clicked',
+                'label': label, 'route': route,
+                'confirm_route': confirmed_dialog}
+
+    def dismiss_boss_login_notice(self, hwnd):
+        # Chromium exposes this tab-modal as a separate RootView window rather
+        # than a document descendant. Dismiss only the exact known login notice.
+        try:
+            root = self.uia.ElementFromHandle(int(hwnd))
+            dialogs = [n for n in self.all(root)
+                       if n.CurrentControlType == 50032
+                       and 'zhipin.com' in (n.CurrentName or '').lower()]
+        except Exception:
+            return 'not_found'
+        for dialog in dialogs:
+            try:
+                items = self.all(dialog)
+            except Exception:
+                continue
+            notice = [n for n in items if n.CurrentControlType == 50020
+                      and ('登录过' in (n.CurrentName or '')
+                           or '请勿重复登录' in (n.CurrentName or ''))]
+            if not notice:
+                continue
+            buttons = [n for n in items if n.CurrentControlType == 50000
+                       and (n.CurrentName or '').strip() in ('确定', '确认', 'OK')
+                       and not n.CurrentIsOffscreen]
+            if len(buttons) != 1:
+                raise ValueError('boss_login_notice_confirm_not_unique')
+            self.invoke(buttons[0])
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                try:
+                    remaining = [n for n in self.all(self.uia.ElementFromHandle(int(hwnd)))
+                                 if n.CurrentControlType == 50032
+                                 and 'zhipin.com' in (n.CurrentName or '').lower()
+                                 and not n.CurrentIsOffscreen]
+                except Exception:
+                    remaining = []
+                if not remaining:
+                    return 'dismissed'
+                time.sleep(.15)
+            raise ValueError('boss_login_notice_dismiss_unconfirmed')
+        return 'not_found'
 
     def inspect(self, pattern='chat|message|editor|user-list|job|select|position|name'):
         root = self.bound()
@@ -964,8 +1195,20 @@ class Bridge:
         # text is account-operation chrome such as "沟通钥匙" consumption.
         dialogue = records[first_system + 1:] if first_system is not None else records
         messages = []
+        non_text_last = False
+        non_text_node = None
+        non_text_role = ''
+        exchange_request = False
         for role, message in dialogue:
             if role == 'system':
+                try:
+                    for value in self.text_values(
+                            message, excluded=_MESSAGE_METADATA):
+                        if is_exchange_request_text(value):
+                            exchange_request = True
+                            break
+                except Exception:
+                    pass
                 continue
             if role == 'unknown':
                 if message.CurrentIsOffscreen:
@@ -978,27 +1221,58 @@ class Bridge:
             if not values:
                 if message.CurrentIsOffscreen:
                     continue
-                raise ValueError('non_text_message_needs_human')
+                # Image, file or platform card: remember that the latest
+                # visible event is not text so the conversation goes to a
+                # human without blocking every other conversation.
+                non_text_last = True
+                non_text_node = message
+                non_text_role = role
+                continue
             text = '\n'.join(values).strip()
             if not text:
-                raise ValueError('non_text_message_needs_human')
+                non_text_last = True
+                non_text_node = message
+                non_text_role = role
+                continue
             if role == 'recruiter' and is_platform_notice_text(text):
                 role = 'system'
             if role == 'system':
                 continue
             messages.append({'id': self.identity(message, text), 'role': role, 'text': text, 'kind': 'text'})
+            non_text_last = False
         if not messages:
-            raise ValueError('no_readable_dialogue')
+            if non_text_last and non_text_node is not None:
+                messages = [{'id': self.identity(non_text_node, '[附件]'),
+                             'role': non_text_role if non_text_role in
+                             ('candidate', 'recruiter') else 'candidate',
+                             'text': '[图片/附件]', 'kind': 'text'}]
+            else:
+                raise ValueError('no_readable_dialogue')
         return {'conversation_id': self.contact_id(fields, row=row), 'candidate_name': name, 'job_id': project,
                 'knowledge_position': knowledge_position, 'mapping_hash': mapping_hash,
                 'job_title': title, 'messages': messages,
+                'non_text_last': non_text_last,
+                'exchange_request': exchange_request,
                 'draft': self.editor_text(self.one(root, p['editor_class'], visible=True)),
                 'identity_verified': True, 'identity_scope': 'logical_name_job_and_runtime_messages',
                 'complete': True}
 
     def listing_records(self):
         p = self.cfg['profile']
-        listing = self.one(self.bound(), p['list_class'], visible=True)
+        last_error = None
+        listing = None
+        for _ in range(4):
+            try:
+                listing = self.one(self.bound(), p['list_class'], visible=True)
+                break
+            except ValueError as exc:
+                last_error = exc
+                if ('not_unique' not in str(exc)
+                        and 'NULL COM' not in str(exc)):
+                    raise
+                time.sleep(.3)
+        if listing is None:
+            raise last_error
         records = []
         for row in self.nodes(listing, p['item_class']):
             try:
@@ -1027,12 +1301,76 @@ class Bridge:
             ids.append(cid)
             if record['unread']:
                 unread.append(cid)
+        if not unread:
+            badge = self.menu_unread_count(root)
+            if badge:
+                # The list may be scrolled below the red dots. Reset it to the
+                # top, then filter to unread conversations if still unseen.
+                try:
+                    self.click_list_tab('全部')
+                    time.sleep(.7)
+                    records = self.listing_records()
+                    ids, unread = [], []
+                    for record in records:
+                        fields = record['fields']
+                        cid = self.contact_id(fields, runtime=record['runtime'])
+                        ids.append(cid)
+                        if record['unread']:
+                            unread.append(cid)
+                    if not unread:
+                        self.click_list_tab('未读')
+                        time.sleep(1.2)
+                        try:
+                            switched = self.listing_records()
+                        except Exception:
+                            switched = None
+                        if switched:
+                            records = switched
+                            ids, unread = [], []
+                            for record in records:
+                                fields = record['fields']
+                                cid = self.contact_id(fields, runtime=record['runtime'])
+                                ids.append(cid)
+                                unread.append(cid)
+                        else:
+                            self.click_list_tab('全部')
+                            time.sleep(.8)
+                except Exception:
+                    pass
         if len(ids) != len(set(ids)):
             raise ValueError('contact_identity_collision')
         return {'complete': True, 'scan_scope': 'loaded_sidebar_window',
                 'conversation_ids': ids, 'unread_ids': unread,
                 'loaded_conversation_count': len(ids),
                 'visible_conversation_count': sum(record['visible'] for record in records)}
+
+    def menu_unread_count(self, root=None):
+        root = root or self.bound()
+        try:
+            condition = self.uia.CreatePropertyCondition(30003, 50005)
+            found = root.FindAll(4, condition)
+            for index in range(found.Length):
+                node = found.GetElement(index)
+                if node.CurrentIsOffscreen:
+                    continue
+                match = re.fullmatch(
+                    r'消息\s*(\d+)', (node.CurrentName or '').strip())
+                if match:
+                    return int(match.group(1))
+        except Exception:
+            pass
+        return 0
+
+    def click_list_tab(self, label):
+        root = self.bound()
+        found = [n for n in self.all(root)
+                 if not n.CurrentIsOffscreen
+                 and (n.CurrentName or '').strip() == label]
+        if not found:
+            raise ValueError('list_tab_not_found:' + label)
+        # The list sub-tabs sit below the top inbox tabs; pick the lowest.
+        found.sort(key=lambda n: n.CurrentBoundingRectangle.top, reverse=True)
+        return self.click_node_center(found[0])
 
     def read(self, cid, candidate_name=None, job_title=None):
         root, p = self.bound(), self.cfg['profile']
@@ -1124,14 +1462,10 @@ class Bridge:
                     raise ValueError('conversation_changed_after_send')
             sent = [m for m in current['messages'] if m['id'] not in old_ids and m['role'] == 'recruiter' and m['text'] == text]
             if len(sent) == 1 and not current['draft'].strip():
-                selection = self.clear_selection()
-                if selection.get('state') not in ('cleared', 'already_cleared'):
-                    time.sleep(.4)
-                    selection = self.clear_selection()
                 return {'state': 'sent', 'conversation_id': expected['conversation_id'],
                         'job_id': expected['job_id'],
                         'message_id': sent[0]['id'], 'text': text,
-                        'selection_cleared': selection.get('state') in ('cleared', 'already_cleared')}
+                        'selection_cleared': False, 'selection_kept': True}
         if last_error is not None:
             raise last_error
         raise ValueError('send_result_unknown')
@@ -1229,10 +1563,6 @@ class Bridge:
             texts.append(text)
             current = dict(last_snapshot, draft='')
             time.sleep(random.uniform(.35, .8))
-        selection = self.clear_selection()
-        if selection.get('state') not in ('cleared', 'already_cleared'):
-            time.sleep(.4)
-            selection = self.clear_selection()
         return {
             'state': 'sent',
             'conversation_id': expected['conversation_id'],
@@ -1241,7 +1571,8 @@ class Bridge:
             'message_ids': message_ids,
             'texts': texts,
             'text': ' '.join(texts),
-            'selection_cleared': selection.get('state') in ('cleared', 'already_cleared'),
+            'selection_cleared': False,
+            'selection_kept': True,
         }
 
     def test_send(self, expected_name, text):
@@ -1272,10 +1603,9 @@ class Bridge:
                     if message['id'] not in old_ids and message['role'] == 'recruiter'
                     and message['text'] == text]
             if len(sent) == 1 and not current['draft']:
-                selection = self.clear_selection()
                 return {'state': 'test_sent', 'conversation_id': current['conversation_id'],
                         'message_id': sent[0]['id'], 'text': text,
-                        'selection_cleared': selection.get('state') == 'cleared'}
+                        'selection_cleared': False, 'selection_kept': True}
         raise ValueError('send_result_unknown')
 
     def draft_test(self, text, clear=True):
@@ -1289,6 +1619,123 @@ class Bridge:
             self.clear_editor(text)
             result.update(state='draft_verified_and_cleared', cleared=True)
         return result
+
+    def draft_text(self):
+        """Read the editor without treating its content as a takeover latch."""
+        return {'state': 'draft', 'text': self.editor_text()}
+
+    def send_many(self, expected, groups):
+        """Send several reply groups to the same conversation in order."""
+        if (not isinstance(groups, list) or not 1 <= len(groups) <= 3
+                or any(not isinstance(group, list) for group in groups)):
+            raise ValueError('reply_groups_invalid')
+        current = expected
+        message_ids = []
+        texts = []
+        for index, group in enumerate(groups):
+            receipt = self.send_segments(current, group)
+            message_ids.extend(receipt.get('message_ids') or [])
+            texts.extend(receipt.get('texts') or [])
+            if index + 1 < len(groups):
+                current = self.snapshot()
+        return {
+            'state': 'sent',
+            'conversation_id': expected['conversation_id'],
+            'job_id': expected['job_id'],
+            'message_ids': message_ids,
+            'texts': texts,
+            'message_id': message_ids[0] if message_ids else '',
+            'text': ' '.join(texts),
+        }
+
+    def click_exchange(self, kind):
+        labels = {'wechat': '换微信', 'phone': '换电话', 'resume': '求简历'}
+        label = labels.get(kind)
+        if not label:
+            raise ValueError('exchange_kind_invalid')
+        return self.click_toolbar(label)
+
+    def exchange_target(self, kind):
+        labels = {'wechat': '换微信', 'phone': '换电话', 'resume': '求简历'}
+        label = labels.get(kind)
+        if not label:
+            raise ValueError('exchange_kind_invalid')
+        node = self.find_toolbar(label)
+        rect = node.CurrentBoundingRectangle
+        return {
+            'state': 'target', 'label': label,
+            'enabled': bool(node.CurrentIsEnabled),
+            'rect': [rect.left, rect.top, rect.right, rect.bottom],
+            'foreground': foreground_hwnd() == int(self.cfg['binding']['hwnd']),
+        }
+
+    def accept_exchange_request(self):
+        """Accept a candidate-initiated WeChat/phone/resume exchange."""
+        root = self.bound()
+        p = self.cfg['profile']
+        requests = []
+        buttons = []
+
+        def collect(root):
+            requests.clear()
+            buttons.clear()
+            for node in self.all(root):
+                try:
+                    name = (node.CurrentName or '').strip()
+                    if not name or len(name) > 80:
+                        continue
+                    if is_exchange_request_text(name):
+                        requests.append(node)
+                    elif name in ('同意', '接受', '同意交换', '确认交换'):
+                        buttons.append(node)
+                except Exception:
+                    continue
+
+        collect(root)
+        if not requests:
+            return {'state': 'none'}
+        visible = [node for node in requests if not node.CurrentIsOffscreen]
+        if not visible:
+            try:
+                scope = self.one(root, p['message_root_class'], visible=True)
+                box = scope.CurrentBoundingRectangle
+                scroll_screen_wheel(
+                    (box.left + box.right) // 2,
+                    (box.top + box.bottom) // 2, -10)
+                time.sleep(.8)
+            except Exception:
+                pass
+            root = self.bound()
+            collect(root)
+            visible = [node for node in requests if not node.CurrentIsOffscreen]
+        usable = [node for node in buttons if not node.CurrentIsOffscreen]
+        if not usable:
+            return {'state': 'request_not_visible' if not visible
+                    else 'request_without_button'}
+        rect = (visible[0] if visible else requests[0]).CurrentBoundingRectangle
+        center = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
+
+        def distance(node):
+            box = node.CurrentBoundingRectangle
+            return (abs((box.left + box.right) / 2 - center[0])
+                    + abs((box.top + box.bottom) / 2 - center[1]))
+
+        usable.sort(key=distance)
+        node = usable[0]
+        if distance(node) > 420:
+            return {'state': 'request_not_visible'}
+        route = self.click_node_center(node)
+        return {'state': 'accepted', 'route': route,
+                'label': (node.CurrentName or '').strip()}
+
+    def clear_draft(self, expected):
+        """Clear only the exact text that the caller already verified."""
+        text = self.editor_text()
+        if text != expected:
+            raise ValueError('draft_changed_refusing_to_clear')
+        if text:
+            self.clear_editor(text)
+        return {'state': 'cleared', 'text': expected}
 
 
 def main(request):
@@ -1358,12 +1805,24 @@ def main(request):
         return bridge.send(request['expected'], request['text'])
     if action == 'send_segments':
         return bridge.send_segments(request['expected'], request['segments'])
+    if action == 'send_many':
+        return bridge.send_many(request['expected'], request['groups'])
+    if action == 'click_exchange':
+        return bridge.click_exchange(request['kind'])
+    if action == 'exchange_target':
+        return bridge.exchange_target(request['kind'])
+    if action == 'accept_exchange_request':
+        return bridge.accept_exchange_request()
     if action == 'test_send':
         return bridge.test_send(request['expected_name'], request['text'])
     if action == 'clear_selection':
         return bridge.clear_selection()
     if action == 'draft_test':
         return bridge.draft_test(request['text'], request.get('clear', True))
+    if action == 'draft_text':
+        return bridge.draft_text()
+    if action == 'clear_draft':
+        return bridge.clear_draft(request.get('text') or '')
     raise ValueError('unknown_native_action')
 
 

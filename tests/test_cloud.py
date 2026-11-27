@@ -43,6 +43,58 @@ class CloudTests(unittest.TestCase):
             self.assertIn('岗位1', payload['conversation'])
             self.assertNotIn('conversation_id', payload)
 
+    def test_forced_follow_up_allows_our_last_message(self):
+        messages = self.request['snapshot']['messages'] + [
+            {'id': '3', 'role': 'recruiter', 'text': '方便的话留个联系方式'}]
+        request = {'force_reply': True,
+                   'snapshot': dict(self.request['snapshot'], messages=messages)}
+        with patch.object(self.client, 'capabilities', return_value={'stateless_hr_reply': 1}), \
+                patch.object(self.client, 'request', return_value=self.result()) as post:
+            output = self.client.generate(request)
+            self.assertEqual(output['action'], 'reply')
+            payload = post.call_args.args[1]
+            self.assertEqual(payload['question'], '工资呢')
+            self.assertIn('主动补发', payload['conversation'])
+        with patch.object(self.client, 'capabilities', return_value={'stateless_hr_reply': 1}), \
+                patch.object(self.client, 'request', return_value=self.result()):
+            with self.assertRaisesRegex(ValueError, 'latest_message_is_not_candidate'):
+                self.client.generate(
+                    {'snapshot': dict(self.request['snapshot'], messages=messages)})
+
+    def test_two_quick_messages_are_answered_separately(self):
+        messages = [
+            {'id': '1', 'role': 'recruiter', 'text': '你好'},
+            {'id': '2', 'role': 'candidate', 'text': '工资多少'},
+            {'id': '3', 'role': 'candidate', 'text': '包住吗'},
+        ]
+        request = {'snapshot': dict(self.request['snapshot'], messages=messages)}
+        with patch.object(self.client, 'capabilities',
+                          return_value={'stateless_hr_reply': 1}), \
+                patch.object(self.client, 'request',
+                             return_value=self.result()) as post:
+            output = self.client.generate(request)
+        self.assertEqual(len(output['items']), 2)
+        self.assertEqual(
+            [call.args[1]['question'] for call in post.call_args_list],
+            ['工资多少', '包住吗'])
+        self.assertEqual(output['segments'],
+                         ['这个岗位的工资需要面议', '这个岗位的工资需要面议'])
+
+    def test_greeting_is_merged_into_the_following_question(self):
+        messages = [
+            {'id': '1', 'role': 'recruiter', 'text': '你好'},
+            {'id': '2', 'role': 'candidate', 'text': '在吗'},
+            {'id': '3', 'role': 'candidate', 'text': '工资多少'},
+        ]
+        request = {'snapshot': dict(self.request['snapshot'], messages=messages)}
+        with patch.object(self.client, 'capabilities',
+                          return_value={'stateless_hr_reply': 1}), \
+                patch.object(self.client, 'request',
+                             return_value=self.result()) as post:
+            output = self.client.generate(request)
+        self.assertNotIn('items', output)
+        self.assertEqual(len(post.call_args_list), 1)
+
     def test_uncertainty_uses_safe_confirmation_reply(self):
         result = self.result()
         result['needs_verification'] = True

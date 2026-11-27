@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path.home() / 'Desktop/自动招呼/03 岗位配置'
+DEFAULT_ROOT = Path.home() / 'Desktop/自动招呼/04 回复配置'
+LEGACY_ROOT = Path.home() / 'Desktop/自动招呼/03 岗位配置'
 FILE_NAME = '岗位对应关系.json'
 
 
@@ -14,6 +15,10 @@ class Preferences:
         self.root = Path(root or DEFAULT_ROOT).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / FILE_NAME
+        legacy = LEGACY_ROOT / FILE_NAME
+        if (self.root == DEFAULT_ROOT and not self.path.exists()
+                and legacy.exists() and legacy != self.path):
+            self.path.write_text(legacy.read_text(encoding='utf-8-sig'), encoding='utf-8')
         if self.path.exists():
             data = json.loads(self.path.read_text(encoding='utf-8-sig'))
             if data == {}:

@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from mapping_window import visible_row_count
+from mapping_window import AUTO_START_SECONDS, visible_row_count
 from preferences import Preferences
 
 
 class MappingLayoutTests(unittest.TestCase):
+    def test_auto_start_waits_five_minutes(self):
+        self.assertEqual(AUTO_START_SECONDS, 300)
+
     def test_visible_rows_are_bounded_from_one_to_five_and_a_half(self):
         self.assertEqual(visible_row_count(0), 1.0)
         self.assertEqual(visible_row_count(1), 1.0)

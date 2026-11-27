@@ -42,6 +42,40 @@ class SegmentedSender:
         }
 
 
+class ExchangeSender:
+    def __init__(self):
+        self.calls = []
+        self.exchanges = []
+
+    def send(self, s, text):
+        self.calls.append(text)
+        return {'state': 'sent', 'conversation_id': s['conversation_id'],
+                'job_id': s['job_id'], 'text': text,
+                'message_id': f'ex-{len(self.calls)}'}
+
+    def click_exchange(self, kind):
+        self.exchanges.append(kind)
+        return {'state': 'exchange_sent', 'label': kind}
+
+
+class MultiSender:
+    def __init__(self):
+        self.groups = []
+        self.ids = 0
+
+    def send_many(self, s, groups):
+        self.groups.append([list(group) for group in groups])
+        ids = []
+        for group in groups:
+            for _ in group:
+                self.ids += 1
+                ids.append(f'multi-{self.ids}')
+        texts = [text for group in groups for text in group]
+        return {'state': 'sent', 'conversation_id': s['conversation_id'],
+                'job_id': s['job_id'], 'message_ids': ids, 'texts': texts,
+                'message_id': ids[0], 'text': ' '.join(texts)}
+
+
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -72,6 +106,12 @@ class EngineTests(unittest.TestCase):
         again = Store(self.store.path)
         again.ingest(s, ['项目A'])
         self.assertEqual([x['request_id'] for x in again.pending()], [r['request_id']])
+
+    def test_disabled_job_cancels_queued_requests(self):
+        _, request = self.event()
+        removed = self.store.prune_jobs(['项目B'])
+        self.assertEqual(removed, [request['request_id']])
+        self.assertEqual(self.store.pending(), [])
 
     def test_first_new_conversation_after_baseline_is_processed(self):
         result = self.store.ingest(snapshot('brand-new'), ['项目A'], new_is_event=True)
@@ -126,6 +166,18 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.respond(r['request_id'], 'wrong', 'reply', 'hello')
 
+    def test_manual_handoff_records_question_and_reason(self):
+        s, r = self.event()
+        self.assertEqual(
+            self.store.respond(
+                r['request_id'], r['version'], 'manual', '知识库无法确认该问题')['state'],
+            'manual',
+        )
+        handoff = self.store.latest_handoff('c1')
+        self.assertTrue(handoff['needs_human'])
+        self.assertIn('工作地点呢', handoff['question'])
+        self.assertEqual(handoff['reason'], '知识库无法确认该问题')
+
     def test_human_draft_latches_until_explicit_release(self):
         s, r = self.ready()
         s['draft'] = '我来回复'
@@ -134,6 +186,37 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.store.ingest(s, ['项目A'])['state'], 'manual')
         self.store.manual('c1', release=True)
         self.assertEqual(self.store.status()['manual_conversations'], 0)
+
+    def test_image_latest_message_latches_only_that_conversation(self):
+        self.store.ingest(snapshot(), ['项目A'])
+        s = snapshot(extra=[
+            {'id': 'img', 'role': 'candidate', 'text': '[图片/附件]', 'kind': 'text'},
+        ])
+        s['non_text_last'] = True
+        result = self.store.ingest(s, ['项目A'])
+        self.assertEqual(result['state'], 'manual')
+        self.assertEqual(result['reason'], 'non_text_message_needs_human')
+        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.store.status()['manual_conversations'], 1)
+
+    def test_next_queued_name_skips_current_conversation(self):
+        first = snapshot('c1')
+        first['candidate_name'] = '甲'
+        second = snapshot('c2')
+        second['candidate_name'] = '乙'
+        self.store.ingest(first, ['项目A'], new_is_event=True)
+        self.store.ingest(second, ['项目A'], new_is_event=True)
+        self.assertEqual(self.store.next_queued_name('c1'), '乙')
+        self.assertEqual(self.store.next_queued_name('c2'), '甲')
+
+    def test_overlay_label_uses_short_job_name(self):
+        self.assertEqual(
+            reply.overlay_label(
+                {'candidate_name': '李萌', 'job_id': '14 博格华纳'}),
+            '李萌（博格华纳）')
+        self.assertEqual(
+            reply.overlay_label({'candidate_name': '李萌', 'job_id': ''}),
+            '李萌')
 
     def test_human_outbound_is_not_mistaken_for_candidate(self):
         s, r = self.event()
@@ -155,11 +238,168 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.store.status()['control'], 'paused')
         self.assertEqual(self.store.dispatch(r['request_id'], s, sender, True)['state'], 'not_ready')
         self.assertEqual(len(sender.calls), 1)
-        with self.assertRaises(ValueError):
-            self.store.control('resume')
+        self.assertEqual(self.store.control('resume')['control'], 'running')
         self.store.resolve(r['request_id'], 'not_sent')
         self.store.control('resume')
         self.assertEqual(self.store.ready(), [])
+
+    def test_resume_reconciles_unknown_send_against_page(self):
+        s, r = self.ready()
+        self.store.dispatch(r['request_id'], s, Sender(True), True)
+        self.store.control('resume')
+        result = self.store.reconcile_unknown(lambda cid, previous: s, ['项目A'])
+        self.assertEqual(result[0]['state'], 'requeued')
+        self.assertEqual(self.store.pending()[0]['request_id'], r['request_id'])
+        self.assertEqual(self.store.status()['counts'].get('unknown'), None)
+        self.store.respond(r['request_id'], r['version'], 'reply', '地点在宁波。')
+        self.assertEqual(len(self.store.ready()), 1)
+
+    def test_reconcile_unknown_recognizes_platform_receipt(self):
+        s, r = self.ready()
+        self.store.dispatch(r['request_id'], s, Sender(True), True)
+        sent = copy.deepcopy(s)
+        sent['messages'].append(
+            {'id': 'platform-sent', 'role': 'recruiter', 'text': '地点需要核实', 'kind': 'text'})
+        result = self.store.reconcile_unknown(lambda cid, previous: sent, ['项目A'])
+        self.assertEqual(result[0]['state'], 'sent')
+        self.assertEqual(result[0]['message_ids'], ['platform-sent'])
+        self.assertEqual(self.store.pending(), [])
+
+    def test_reconcile_unknown_without_page_access_hands_to_human(self):
+        s, r = self.ready()
+        self.store.dispatch(r['request_id'], s, Sender(True), True)
+        self.store.control('resume')
+
+        def unavailable(cid, previous):
+            raise ValueError('bound_chat_or_boss_not_visible')
+
+        result = self.store.reconcile_unknown(unavailable, ['项目A'])
+        self.assertEqual(result[0]['state'], 'needs_human')
+        self.assertEqual(self.store.status()['control'], 'running')
+        self.assertEqual(self.store.status()['manual_conversations'], 1)
+        self.assertTrue(self.store.latest_handoff('c1')['needs_human'])
+
+    def test_two_quick_candidate_messages_keep_a_live_queue_slot(self):
+        s, r = self.ready()
+        newest = copy.deepcopy(s)
+        newest['messages'].append(
+            {'id': 'm4', 'role': 'candidate', 'text': '几点上班', 'kind': 'text'})
+        self.assertEqual(self.store.ingest(newest, ['项目A'])['state'], 'pending')
+        pending = self.store.pending()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['snapshot']['messages'][-1]['id'], 'm4')
+        # The second message arrived before generation: the same trailing
+        # question must not stay stale on a later scan.
+        with self.store.db() as db:
+            db.execute("UPDATE requests SET state='stale' WHERE state='pending'")
+        self.assertEqual(
+            self.store.queue_unread(newest, ['项目A'])['state'], 'pending')
+        self.assertEqual(len(self.store.pending()), 1)
+
+    def test_reply_current_regenerates_when_candidate_spoke_last(self):
+        s, r = self.ready()
+        self.assertEqual(self.store.requeue_current(s, ['项目A'])['state'], 'pending')
+        self.assertEqual([x['request_id'] for x in self.store.pending()], [r['request_id']])
+
+    def test_forced_reply_works_even_when_our_message_is_last(self):
+        s, r = self.ready()
+        ours = copy.deepcopy(s)
+        ours['messages'].append(
+            {'id': 'ours', 'role': 'recruiter', 'text': '刚回复过', 'kind': 'text'})
+        self.assertEqual(
+            self.store.requeue_current(ours, ['项目A'])['state'], 'no_reply_needed')
+        result = self.store.requeue_current(
+            ours, ['项目A'], force_reply=True)
+        self.assertEqual(result['state'], 'pending')
+        pending = self.store.pending()
+        self.assertEqual(len(pending), 1)
+        self.assertTrue(pending[0].get('force_reply'))
+        second = self.store.requeue_current(ours, ['项目A'], force_reply=True)
+        self.assertNotEqual(result['request_id'], second['request_id'])
+        self.assertEqual(len(self.store.pending()), 1)
+
+    def test_reply_current_does_not_override_human_draft(self):
+        s, r = self.ready()
+        s['draft'] = '我自己回'
+        self.assertEqual(self.store.requeue_current(s, ['项目A'])['state'], 'manual')
+
+    def test_own_reply_echo_is_not_a_human_draft(self):
+        s, r = self.event()
+        self.store.respond(
+            r['request_id'], r['version'], 'reply',
+            '长白班和倒班都有的，想赚钱的可以选择倒班。')
+        self.assertTrue(self.store.is_own_draft('长白班和倒班都有的'))
+        self.assertFalse(self.store.is_own_draft('你好在吗'))
+        self.assertFalse(self.store.is_own_draft(''))
+
+    def test_contact_request_uses_wechat_then_phone_once(self):
+        self.assertEqual(self.store.exchange_kind('c1', '你好'), '')
+        self.assertEqual(
+            self.store.exchange_kind('c1', '方便的话留个联系方式'), 'wechat')
+        self.store.record_exchange('c1', 'wechat')
+        self.assertEqual(self.store.exchange_kind('c1', '加个微信吧'), 'phone')
+        self.store.record_exchange('c1', 'phone')
+        self.assertEqual(self.store.exchange_kind('c1', '加个微信吧'), '')
+
+    def test_dispatch_clicks_exchange_after_contact_reply(self):
+        s, r = self.event()
+        self.store.respond(
+            r['request_id'], r['version'], 'reply',
+            '方便的话留个联系方式，我把岗位说明发您。')
+        sender = ExchangeSender()
+        result = self.store.dispatch(r['request_id'], s, sender, True)
+        self.assertEqual(result['state'], 'sent')
+        self.assertEqual(sender.exchanges, ['wechat'])
+        self.assertEqual(self.store.exchange_counts('c1'), {'wechat': 1})
+        newer = copy.deepcopy(s)
+        newer['messages'].append(
+            {'id': 'ex-1', 'role': 'recruiter',
+             'text': '方便的话留个联系方式，我把岗位说明发您', 'kind': 'text'})
+        newer['messages'].append(
+            {'id': 'm9', 'role': 'candidate', 'text': '怎么联系', 'kind': 'text'})
+        self.store.ingest(newer, ['项目A'])
+        request = self.store.pending()[0]
+        self.store.respond(
+            request['request_id'], request['version'], 'reply', '您加我微信吧。')
+        self.assertEqual(
+            self.store.dispatch(request['request_id'], newer, sender, True)['state'],
+            'sent')
+        self.assertEqual(sender.exchanges, ['wechat', 'phone'])
+
+    def test_multi_item_answer_sends_each_group_in_order(self):
+        s, r = self.event()
+        items = [
+            {'text': '你好', 'segments': ['你好']},
+            {'text': '岗位在招', 'segments': ['岗位在招']},
+        ]
+        self.store.respond(
+            r['request_id'], r['version'], 'reply', '你好 岗位在招',
+            segments=['你好', '岗位在招'], items=items)
+        sender = MultiSender()
+        result = self.store.dispatch(r['request_id'], s, sender, True)
+        self.assertEqual(result['state'], 'sent')
+        self.assertEqual(sender.groups, [[['你好'], ['岗位在招']]])
+        self.assertEqual(self.store.status()['counts']['sent'], 1)
+
+    def test_reply_current_releases_human_outbound_but_not_takeover(self):
+        s, r = self.ready()
+        with self.store.db() as db:
+            db.execute(
+                "UPDATE conversations SET manual=1,reason='human_outbound_detected' "
+                "WHERE id='c1'")
+        self.assertEqual(self.store.requeue_current(s, ['项目A'])['state'], 'manual')
+        self.assertEqual(
+            self.store.requeue_current(
+                s, ['项目A'], release_latches=True)['state'], 'pending')
+        with self.store.db() as db:
+            db.execute(
+                "UPDATE conversations SET manual=1,reason='user_takeover' WHERE id='c1'")
+        self.assertEqual(
+            self.store.requeue_current(
+                s, ['项目A'], release_latches=True)['state'], 'manual')
+        self.assertEqual(
+            self.store.requeue_current(
+                s, ['项目A'], force_reply=True)['state'], 'pending')
 
     def test_process_crash_during_send_requires_platform_check(self):
         s, r = self.ready()
@@ -295,6 +535,40 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(set(saved['accounts']), {'账号A', '账号B'})
             finally:
                 reply.STATE = original_state
+
+    def test_job_checkbox_state_becomes_reply_allowlist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / '岗位对应关系.json'
+            path.write_text(json.dumps({
+                'version': 1,
+                'accounts': {
+                    '账号A': {
+                        'records': [
+                            {
+                                'boss_title': '岗位A',
+                                'cloud_company': '公司A',
+                                'cloud_position': '职位A',
+                                'enabled': True,
+                            },
+                            {
+                                'boss_title': '岗位B',
+                                'cloud_company': '公司B',
+                                'cloud_position': '职位B',
+                                'enabled': False,
+                            },
+                        ]
+                    }
+                },
+            }, ensure_ascii=False), encoding='utf-8')
+            cfg = reply.defaults()
+            cfg['account'] = '账号A'
+            cfg['cloud_mapping_preferences'] = str(path)
+            self.assertTrue(reply.sync_job_selection(cfg))
+            self.assertEqual(cfg['allowed_jobs'], ['公司A'])
+            self.assertEqual(cfg['job_aliases'], {'岗位A': '公司A'})
+            self.assertEqual(cfg['job_enabled'], {'岗位A': True, '岗位B': False})
+            self.assertEqual(cfg['enabled_jobs'], ['岗位A'])
+            self.assertEqual(cfg['disabled_jobs'], ['岗位B'])
 
 
 if __name__ == '__main__':
